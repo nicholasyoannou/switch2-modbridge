@@ -86,6 +86,17 @@ tested on a console yet.** Steps are in [tools/modbridge/README.md](tools/modbri
   [mods/ff7r-intergrade/README.txt](mods/ff7r-intergrade/README.txt)). Rebirth:
   [mods/ff7-rebirth/README.txt](mods/ff7-rebirth/README.txt) (untested). The paks are game data, so don't share them.
 
+As for the performance of these mods, on the 120 FPS variant (since the Switch display is 120 Hz haven't tested above that) the game in handheld mode during combat (tested in Chapter 1 and early Chapter 2) maintains 40 FPS. Docked it can waver from 40 to 60 FPS (which I think is the max the dock can handle). I've attached footage recorded footage below via (a cheap) USB-HDMI for docked.
+
+<table>
+  <tr>
+    <th>Docked</th>
+  </tr>
+  <tr>
+    <td><a href="https://otgsytpue8.ufs.sh/f/9ac2dkswyWNhd2rJjQzeNKOVcp7jsDAxfR8rYFL9mXPZ3QgS"><img width="540" height="304" alt="ff7r-demo-play" src="https://github.com/user-attachments/assets/2949e453-2bcb-4c76-a98f-a65f0ab2c5a5" /></a></td>
+  </tr>
+</table>
+
 ## How it works
 
 - **kaiHEN patches** (`kaihen/patches`, against [ouncebrew/kaihen](https://github.com/ouncebrew/kaihen) tag
