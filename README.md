@@ -129,12 +129,12 @@ The release zips already contain these builds, and they rebuild byte-for-byte fr
 
 You can install only once per boot. A failed install can crash FS, which reboots the console.
 
-### ESP32 LDN board: persist the kaiHEN chain without a PC (untested)
+### ESP32 LDN board: persist the kaiHEN chain without a PC
 
 For developers. This uses [SeanHeuc's esp32-ldn-civ7](https://github.com/SeanHeuc/CivSwitch/tree/main/esp32-ldn-civ7)
 firmware unchanged (layout checked at SeanHeuc/CivSwitch `5bba4b6`), and replaces only its `blob_apply.bin` with
 one that runs CivSwitchFS-kaiHEN's persist installer. One LDN lobby run then sets up the Load Game → kaiHEN
-chain, the same as `npm run persist:chain`, with no PC. **Not tested on a console yet.**
+chain, the same as `npm run persist:chain`, with no PC. Tested on firmware 23.0.1.
 
 1. Build esp32-ldn-civ7 with your own `prod.keys`, following its README. The firmware it builds contains keys
    derived from your `prod.keys`, so never share it.
