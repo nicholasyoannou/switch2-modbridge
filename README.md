@@ -88,7 +88,7 @@ tested on a console yet.** Steps are in [tools/modbridge/README.md](tools/modbri
   [mods/ff7r-intergrade/README.txt](mods/ff7r-intergrade/README.txt)). Rebirth:
   [mods/ff7-rebirth/README.txt](mods/ff7-rebirth/README.txt) (untested). The paks are game data, so don't share them.
 
-As for the performance of these mods, on the 120 FPS variant (since the Switch display is 120 Hz haven't tested above that) the game in handheld mode during combat (tested in Chapter 1 and early Chapter 2) maintains 40 FPS. Docked it can waver from 40 to 60 FPS (which I think is the max the dock can handle). I've attached footage recorded footage below via (a cheap) USB-HDMI for docked.
+As for the performance of these mods, on the 120 FPS variant (since the Switch display is 120 Hz haven't tested above that) the game in handheld mode during combat (tested in Chapter 1 and early Chapter 2) maintains 40 FPS. Docked it can waver from 40 to 60 FPS (my capture card caps at 60FPS so max it's capable of needs further testing). I've attached footage recorded footage below via (a cheap) USB-HDMI for docked.
 
 <table>
   <tr>
