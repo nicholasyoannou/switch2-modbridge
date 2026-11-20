@@ -1,0 +1,221 @@
+From 754d1ca1460dd7be1db8b29ab1dfa1b180391ec4 Mon Sep 17 00:00:00 2001
+From: switch2-scripts <switch2-scripts@localhost>
+Date: Thu, 19 Nov 2026 22:42:36 +0000
+Subject: [PATCH 2/5] ro:dmnt: accept ns2jb-modloader's helper requests and add
+ FS memory write
+
+Helper requests may send a PID (ns2jb-modloader does) and replies carry RO's
+PID in the special header, as the ns2jb helper's do. 0x524f0016 with a PID is
+the helper's bulk read; without one it stays kaiHEN's read for HEN. 0x26 reads
+any mapped FS page, and 0x28 compares, writes and reads back FS data memory.
+---
+ ro/source/fs_memory.cpp  | 21 +++++++++++++----
+ ro/source/helper_ops.cpp | 49 +++++++++++++++++++++++++++++++++-------
+ ro/source/helper_ops.h   | 12 ++++++----
+ ro/source/wire.cpp       |  7 +++---
+ ro/source/wire.h         |  2 +-
+ 5 files changed, 70 insertions(+), 21 deletions(-)
+
+diff --git a/ro/source/fs_memory.cpp b/ro/source/fs_memory.cpp
+index 8659d77..15e9f15 100644
+--- a/ro/source/fs_memory.cpp
++++ b/ro/source/fs_memory.cpp
+@@ -190,13 +190,21 @@ void closeRequestHandles(const HipcParsedRequest& request) {
+ /// Answers an ns2jb helper command (helper_ops.h), if that is the request.
+ bool serveHelper(void* message, const HipcParsedRequest& request) {
+     const CmifInHeader* header = getHeader(message, request, 32);
+-    if (!header || header->magic != CMIF_IN_HEADER_MAGIC || !roIsHelperCommand(header->command_id))
++    const bool sent_pid = request.meta.send_pid;
++    if (!header || header->magic != CMIF_IN_HEADER_MAGIC || !roIsHelperCommand(header->command_id, sent_pid))
+         return false;
+-    const bool bulk = header->command_id == HelperBulkRead;
++    const u32 command = header->command_id;
++    const bool bulk = command == HelperBulkRead || command == HelperNsBulkRead;
++    const bool write = command == HelperFsWrite;
++    // Like the ns2jb helper: an optional PID, one copied process handle, a buffer only for bulk reads and writes.
++    const HipcMetadata& meta = request.meta;
++    const bool shape = meta.type == CmifCommandType_Request && meta.num_copy_handles == 1 && !meta.num_move_handles &&
++                       !meta.num_send_statics && !meta.num_recv_statics && !meta.num_exch_buffers &&
++                       meta.num_send_buffers == (write ? 1u : 0u) && meta.num_recv_buffers == (bulk ? 1u : 0u);
+     u64 out[23] = {};
+     u32 output_bytes = 0;
+     Result rc = RoResult_BadRequest;
+-    if (hasShape(request, 1, 0, bulk ? 1 : 0) && request.data.copy_handles[0] != INVALID_HANDLE) {
++    if (shape && request.data.copy_handles[0] != INVALID_HANDLE) {
+         const u8* end = reinterpret_cast<const u8*>(request.data.data_words + request.meta.num_data_words);
+         const u8* payload = reinterpret_cast<const u8*>(header + 1);
+         u64 input[8] = {};
+@@ -204,10 +212,13 @@ bool serveHelper(void* message, const HipcParsedRequest& request) {
+         std::memcpy(input, payload, bytes);
+         rc = roHelperRequest(header->command_id, input, bytes, request.data.copy_handles[0], out, &output_bytes,
+             bulk ? hipcGetBufferAddress(&request.data.recv_buffers[0]) : nullptr,
+-            bulk ? hipcGetBufferSize(&request.data.recv_buffers[0]) : 0);
++            bulk ? hipcGetBufferSize(&request.data.recv_buffers[0]) : 0,
++            write ? hipcGetBufferAddress(&request.data.send_buffers[0]) : nullptr,
++            write ? hipcGetBufferSize(&request.data.send_buffers[0]) : 0);
+     }
+     closeRequestHandles(request);
+-    roWriteDataReply(message, rc, out, output_bytes);
++    // The kernel puts RO's PID in the reply: ns2jb-modloader checks it against the RO it verified.
++    roWriteDataReply(message, rc, out, output_bytes, true);
+     return true;
+ }
+ 
+diff --git a/ro/source/helper_ops.cpp b/ro/source/helper_ops.cpp
+index 3c16d33..e21d110 100644
+--- a/ro/source/helper_ops.cpp
++++ b/ro/source/helper_ops.cpp
+@@ -82,16 +82,19 @@ Result unmapLocal(Handle process, u64 local, u64 page, u64 size) {
+ 
+ } // namespace
+ 
+-bool roIsHelperCommand(u32 command) {
+-    return (command >= HelperQuery && command <= HelperTextRead) || command == HelperBulkRead;
++bool roIsHelperCommand(u32 command, bool sent_pid) {
++    return (command >= HelperQuery && command <= HelperTextRead) || command == HelperBulkRead ||
++           command == HelperFsWrite || (command == HelperNsBulkRead && sent_pid);
+ }
+ 
+ Result roHelperRequest(u32 command, const u64* input, u32 bytes, Handle process,
+-                       u64* out, u32* output_bytes, void* receive, u64 receive_size) {
++                       u64* out, u32* output_bytes, void* receive, u64 receive_size,
++                       const void* send, u64 send_size) {
+     *output_bytes = 64;
+     if (bytes < 32)
+         return BadInput;
+-    if (receive_size && command != HelperBulkRead)
++    if ((receive_size && command != HelperBulkRead && command != HelperNsBulkRead) ||
++        (send_size && command != HelperFsWrite))
+         return BadInput;
+     u64 pid = 0, program = 0;
+     const Result pid_rc = svcGetProcessId(&pid, process);
+@@ -143,12 +146,14 @@ Result roHelperRequest(u32 command, const u64* input, u32 bytes, Handle process,
+         *output_bytes = 88;
+         return q;
+     }
+-    if (command == HelperBulkRead) {
+-        // At most 4 MiB through a temporary alias in RO.
++    if (command == HelperBulkRead || command == HelperNsBulkRead) {
++        // At most 4 MiB through a temporary alias in RO. The helper's own read is
++        // code memory only; the bridge's may read any FS page (heap objects).
+         const u64 source = input[1], length = input[2], page = source & ~0xfffULL;
++        const bool code = block.type == MemType_CodeStatic || block.type == MemType_CodeMutable;
+         if (!receive || !length || length > 0x400000 || length > receive_size || source + length < source ||
+-            source + length > block.addr + block.size ||
+-            (block.type != MemType_CodeStatic && block.type != MemType_CodeMutable) || block.attr)
++            source + length > block.addr + block.size || block.type == MemType_Unmapped ||
++            (command == HelperNsBulkRead ? !code || block.attr : !fs))
+             return BadInput;
+         const u64 size = ((source & 0xfff) + length + 0xfff) & ~0xfffULL;
+         u64 local = 0;
+@@ -161,6 +166,34 @@ Result roHelperRequest(u32 command, const u64* input, u32 bytes, Handle process,
+         out[6] = length;
+         return out[5];
+     }
++    if (command == HelperFsWrite) {
++        // Compare, write and read back FS data memory (heap or writable code data).
++        const u64 address = input[1], size = input[2], page = address & ~0xfffULL;
++        const u64 mapped_size = ((address & 0xfff) + size + 0xfff) & ~0xfffULL;
++        if (!fs || !send || !size || size > 0x10000 || send_size != 2 * size || address + size < address ||
++            address + size > block.addr + block.size || !(block.perm & Perm_W) || block.type == MemType_CodeStatic)
++            return BadInput;
++        u64 local = 0;
++        out[4] = mapLocal(process, page, mapped_size, &local);
++        out[9] = local;
++        if (out[4])
++            return out[4];
++        u8* target = reinterpret_cast<u8*>(local + (address & 0xfff));
++        const u8* expected = static_cast<const u8*>(send);
++        const u8* replacement = expected + size;
++        Result result = 0;
++        out[6] = !std::memcmp(target, expected, size);
++        if (!out[6])
++            result = BadInput;
++        if (R_SUCCEEDED(result)) {
++            std::memcpy(target, replacement, size);
++            out[7] = !std::memcmp(target, replacement, size);
++            if (!out[7])
++                result = BadInput;
++        }
++        out[8] = unmapLocal(process, local, page, mapped_size);
++        return out[8] ? out[8] : result;
++    }
+     if (command == HelperPatch16) {
+         // One aligned instruction block, with exact expected bytes and readback.
+         const u64 address = input[1], size = input[2], page = address & ~0xfffULL;
+diff --git a/ro/source/helper_ops.h b/ro/source/helper_ops.h
+index 55166ae..a22b17d 100644
+--- a/ro/source/helper_ops.h
++++ b/ro/source/helper_ops.h
+@@ -14,17 +14,21 @@ enum : u32 {
+     HelperUnmapCode = 0x524f0013,  ///< Undo HelperMapCode (FS only).
+     HelperPatch16 = 0x524f0014,    ///< 16-byte instruction patch with expected bytes and readback (FS only).
+     HelperTextRead = 0x524f0015,   ///< Toggle the read bit of FS executable pages (FS only).
+-    HelperBulkRead = 0x524f0026,   ///< The helper's 0x524f0016: up to 4 MiB of code memory.
++    HelperNsBulkRead = 0x524f0016, ///< Helper bulk read, only for requests that send a PID (kaiHEN's own 0x16 does not).
++    HelperBulkRead = 0x524f0026,   ///< Bulk read of any mapped FS page (FS only), up to 4 MiB in one block.
++    HelperFsWrite = 0x524f0028,    ///< FS memory write: send buffer = expected || replacement, compared, written, read back (FS only).
+ };
+ 
+ /// True for the IDs above.
+-bool roIsHelperCommand(u32 command);
++bool roIsHelperCommand(u32 command, bool sent_pid);
+ 
+ /**
+  * @brief Runs one helper command, as the ns2jb helper's process_request.
+  * @param input At least 32 bytes: process ID (0 = any for HelperQuery), address, then command fields.
+  * @param out 23 u64 of reply data; @p output_bytes says how many bytes are used.
+- * @param receive The receive buffer of HelperBulkRead, else null.
++ * @param receive The receive buffer of the bulk reads, else null.
++ * @param send The send buffer of HelperFsWrite, else null.
+  */
+ Result roHelperRequest(u32 command, const u64* input, u32 bytes, Handle process,
+-                       u64* out, u32* output_bytes, void* receive, u64 receive_size);
++                       u64* out, u32* output_bytes, void* receive, u64 receive_size,
++                       const void* send, u64 send_size);
+diff --git a/ro/source/wire.cpp b/ro/source/wire.cpp
+index aa993f3..1098d02 100644
+--- a/ro/source/wire.cpp
++++ b/ro/source/wire.cpp
+@@ -91,12 +91,13 @@ u64 sendBufferSize(const HipcParsedRequest& r, u32 index) {
+ }
+ 
+ void writeReplyMessage(void* base, Result rc, const void* data, u32 data_size, u32 num_copy_handles,
+-                       Handle copy_handle) {
++                       Handle copy_handle, bool send_pid = false) {
+     std::memset(base, 0, MessageSize);
+ 
+     // libnx's data size: the header, the payload and 0x10 bytes of alignment space.
+     HipcRequest hipc = hipcMakeRequestInline(base,
+         .num_data_words = static_cast<u32>((sizeof(CmifOutHeader) + data_size + 0x10 + 3) / sizeof(u32)),
++        .send_pid = send_pid,
+         .num_copy_handles = num_copy_handles,
+     );
+     if (num_copy_handles)
+@@ -178,8 +179,8 @@ void roWriteReply(void* base, Result rc, u64 value, bool has_value) {
+     writeReplyMessage(base, rc, send_value ? &value : nullptr, send_value ? sizeof(value) : 0, 0, INVALID_HANDLE);
+ }
+ 
+-void roWriteDataReply(void* base, Result rc, const void* data, u32 size) {
+-    writeReplyMessage(base, rc, data, size, 0, INVALID_HANDLE);
++void roWriteDataReply(void* base, Result rc, const void* data, u32 size, bool send_pid) {
++    writeReplyMessage(base, rc, data, size, 0, INVALID_HANDLE, send_pid);
+ }
+ 
+ void roWriteHandleReply(void* base, Result rc, Handle handle) {
+diff --git a/ro/source/wire.h b/ro/source/wire.h
+index 85762b2..c85db76 100644
+--- a/ro/source/wire.h
++++ b/ro/source/wire.h
+@@ -60,7 +60,7 @@ bool roReplyQueryPointerBufferSize(void* base);
+ void roWriteReply(void* base, Result rc, u64 value, bool has_value);
+ 
+ /// Writes a reply with @p size bytes of data (at most 184), whatever @p rc is.
+-void roWriteDataReply(void* base, Result rc, const void* data, u32 size);
++void roWriteDataReply(void* base, Result rc, const void* data, u32 size, bool send_pid = false);
+ 
+ /// Writes a reply with a COPY of @p handle on success.
+ void roWriteHandleReply(void* base, Result rc, Handle handle);
+-- 
+2.49.0.windows.1
+

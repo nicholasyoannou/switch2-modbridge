@@ -1,0 +1,446 @@
+From c5c2910801c05a8fce1a58fcb795a9fa81fcfb0a Mon Sep 17 00:00:00 2001
+From: switch2-scripts <switch2-scripts@localhost>
+Date: Thu, 19 Nov 2026 21:54:31 +0000
+Subject: [PATCH 1/5] Add ns2jb helper commands to ro:dmnt and an FS process
+ handle command to HEN
+
+RO serves the ns2jb RO helper's process commands (query, small read, FS code
+map/unmap, 16-byte FS patch, FS text read toggle, bulk read as 0x524f0026)
+on ro:dmnt. Writes and mappings refuse any process but FS.
+
+HEN gains HenHomebrewCommand_GetFilesystemProcess (64), a copy of FS's
+process handle that HEN keeps, so homebrew can address FS on ro:dmnt.
+---
+ hen/source/game_arm.hpp             |   1 +
+ hen/source/server.cpp               |   9 +
+ libkaihen/include/kaihen/protocol.h |   2 +
+ ro/source/fs_memory.cpp             |  28 ++++
+ ro/source/helper_ops.cpp            | 249 ++++++++++++++++++++++++++++
+ ro/source/helper_ops.h              |  30 ++++
+ ro/source/wire.cpp                  |   4 +
+ ro/source/wire.h                    |   3 +
+ 8 files changed, 326 insertions(+)
+ create mode 100644 ro/source/helper_ops.cpp
+ create mode 100644 ro/source/helper_ops.h
+
+diff --git a/hen/source/game_arm.hpp b/hen/source/game_arm.hpp
+index d93d4bf..6bc7860 100644
+--- a/hen/source/game_arm.hpp
++++ b/hen/source/game_arm.hpp
+@@ -30,6 +30,7 @@ class GameArm {
+     /// the system Loader's object, so a client's SetCurrentProcess on any of
+     /// them would rebind it; libounce does not send it on the override.
+     Handle loaderRoot() const { return loader_root_; }
++    Handle filesystemProcess() const { return filesystem_process_; }
+     Result start(Handle filesystem_root, Handle bootstrap_process);
+     void step();
+     HenGameStatus status() const;
+diff --git a/hen/source/server.cpp b/hen/source/server.cpp
+index 317110a..f5fc9a8 100644
+--- a/hen/source/server.cpp
++++ b/hen/source/server.cpp
+@@ -391,6 +391,15 @@ void HenServer::serveHomebrewCommand(const ReceivedRequest& request, u32 index,
+         reply.result = cmifCloneCurrentObject(game_.loaderRoot(), &reply.copy_handle);
+         reply.close_copy_after_send = R_SUCCEEDED(reply.result);
+         break;
++    case HenHomebrewCommand_GetFilesystemProcess:
++        if (game_.filesystemProcess() == INVALID_HANDLE) {
++            reply.result = MAKERESULT(Module_Libnx, LibnxError_NotInitialized);
++            break;
++        }
++        // HEN keeps the handle, as with GetProcessHandle.
++        reply.result = 0;
++        reply.copy_handle = game_.filesystemProcess();
++        break;
+     case HenHomebrewCommand_GetPluginCount:
+         removeExitedPlugins();
+         reply.result = 0;
+diff --git a/libkaihen/include/kaihen/protocol.h b/libkaihen/include/kaihen/protocol.h
+index 7244020..87d86f7 100644
+--- a/libkaihen/include/kaihen/protocol.h
++++ b/libkaihen/include/kaihen/protocol.h
+@@ -90,6 +90,8 @@ typedef enum {
+     /// it to Switch 2 programs as their fsp-ldr override. Every clone shares
+     /// the root's object: a client must not send SetCurrentProcess on it.
+     HenHomebrewCommand_GetLoaderRoot = 23,
++    /// switch2-scripts: a COPY of FS's process handle, for ro:dmnt requests. HEN keeps it.
++    HenHomebrewCommand_GetFilesystemProcess = 64,
+ } HenHomebrewCommand;
+ 
+ /// The reply of HenHomebrewCommand_GetStatus.
+diff --git a/ro/source/fs_memory.cpp b/ro/source/fs_memory.cpp
+index 712ee94..8659d77 100644
+--- a/ro/source/fs_memory.cpp
++++ b/ro/source/fs_memory.cpp
+@@ -5,6 +5,7 @@
+ #include <switch.h>
+ #include "../../common/ro_dmnt.h"
+ #include "session.h"
++#include "helper_ops.h"
+ #include "wire.h"
+ 
+ namespace {
+@@ -186,6 +187,31 @@ void closeRequestHandles(const HipcParsedRequest& request) {
+     }
+ }
+ 
++/// Answers an ns2jb helper command (helper_ops.h), if that is the request.
++bool serveHelper(void* message, const HipcParsedRequest& request) {
++    const CmifInHeader* header = getHeader(message, request, 32);
++    if (!header || header->magic != CMIF_IN_HEADER_MAGIC || !roIsHelperCommand(header->command_id))
++        return false;
++    const bool bulk = header->command_id == HelperBulkRead;
++    u64 out[23] = {};
++    u32 output_bytes = 0;
++    Result rc = RoResult_BadRequest;
++    if (hasShape(request, 1, 0, bulk ? 1 : 0) && request.data.copy_handles[0] != INVALID_HANDLE) {
++        const u8* end = reinterpret_cast<const u8*>(request.data.data_words + request.meta.num_data_words);
++        const u8* payload = reinterpret_cast<const u8*>(header + 1);
++        u64 input[8] = {};
++        const u32 bytes = static_cast<u32>(end - payload) < sizeof(input) ? static_cast<u32>(end - payload) : sizeof(input);
++        std::memcpy(input, payload, bytes);
++        rc = roHelperRequest(header->command_id, input, bytes, request.data.copy_handles[0], out, &output_bytes,
++            bulk ? hipcGetBufferAddress(&request.data.recv_buffers[0]) : nullptr,
++            bulk ? hipcGetBufferSize(&request.data.recv_buffers[0]) : 0);
++    }
++    closeRequestHandles(request);
++    roWriteDataReply(message, rc, out, output_bytes);
++    return true;
++}
++
++
+ } // namespace
+ 
+ void roFsMemoryDispatch(void* message) {
+@@ -195,6 +221,8 @@ void roFsMemoryDispatch(void* message) {
+     const HipcParsedRequest request = hipcParseRequest(message);
+     if (serveDiagnostics(message, request))
+         return;
++    if (serveHelper(message, request))
++        return;
+ 
+     const Result rc = runMemoryCommand(message, request);
+     closeRequestHandles(request);
+diff --git a/ro/source/helper_ops.cpp b/ro/source/helper_ops.cpp
+new file mode 100644
+index 0000000..3c16d33
+--- /dev/null
++++ b/ro/source/helper_ops.cpp
+@@ -0,0 +1,249 @@
++// SPDX-License-Identifier: GPL-2.0-only
++// Port of civ7-fs-kaihen's engine/switch2/ro/payload/process.c (the ns2jb RO
++// helper) to libounce. Reply words keep the helper's layout so a host written
++// for it can read them. Unlike the helper, every command that writes or maps
++// refuses any process but FS.
++#include "helper_ops.h"
++
++#include <cstring>
++
++namespace {
++
++constexpr u64 FilesystemProgramId = 0x0400000000000000ULL;
++constexpr Result BadInput = 0xd401;
++
++void publishCode(u64 address, u64 size) {
++    for (u64 i = 0; i < size; i += 4)
++        __asm__ volatile("dc cvau, %0" ::"r"(address + i) : "memory");
++    __asm__ volatile("dsb ish" ::: "memory");
++    for (u64 i = 0; i < size; i += 4)
++        __asm__ volatile("ic ivau, %0" ::"r"(address + i) : "memory");
++    __asm__ volatile("dsb ish; isb" ::: "memory");
++}
++
++void copyInfo(u64* out, const MemoryInfo& info) {
++    out[0] = info.addr;
++    out[1] = info.size;
++    out[2] = info.type | (static_cast<u64>(info.attr) << 32);
++    out[3] = info.perm | (static_cast<u64>(info.ipc_refcount) << 32);
++    out[4] = info.device_refcount;
++}
++
++u64 info(u32 type, Handle process) {
++    u64 value = 0;
++    return R_SUCCEEDED(svcGetInfo(&value, type, process, 0)) ? value : 0;
++}
++
++/// A free page range in @p process outside its alias and heap regions, or 0.
++u64 freeRemoteAddress(Handle process, u64 size) {
++    const u64 begin = info(InfoType_AslrRegionAddress, process), extent = info(InfoType_AslrRegionSize, process);
++    const u64 alias = info(InfoType_AliasRegionAddress, process), alias_size = info(InfoType_AliasRegionSize, process);
++    const u64 heap = info(InfoType_HeapRegionAddress, process), heap_size = info(InfoType_HeapRegionSize, process);
++    if (!begin || !extent)
++        return 0;
++    u64 at = begin;
++    const u64 end = begin + extent;
++    for (u32 i = 0; i < 256 && at < end; i++) {
++        MemoryInfo block = {};
++        u32 page = 0;
++        if (R_FAILED(svcQueryProcessMemory(&block, &page, process, at)) || !block.size ||
++            block.addr + block.size <= at)
++            return 0;
++        const u64 next = block.addr + block.size;
++        if (at < alias + alias_size && at + size > alias) {
++            at = alias + alias_size;
++            continue;
++        }
++        if (at < heap + heap_size && at + size > heap) {
++            at = heap + heap_size;
++            continue;
++        }
++        if (block.type == MemType_Unmapped && at + size <= next && at + size <= end)
++            return at;
++        at = next;
++    }
++    return 0;
++}
++
++/// Maps @p size bytes of @p process at @p page into RO; *local is 0 on failure.
++Result mapLocal(Handle process, u64 page, u64 size, u64* local) {
++    virtmemLock();
++    void* address = virtmemFindAslr(size, 0x1000);
++    Result rc = address ? svcMapProcessMemory(address, process, page, size)
++                        : MAKERESULT(Module_Libnx, LibnxError_OutOfMemory);
++    virtmemUnlock();
++    *local = R_SUCCEEDED(rc) ? reinterpret_cast<u64>(address) : 0;
++    return rc;
++}
++
++Result unmapLocal(Handle process, u64 local, u64 page, u64 size) {
++    return svcUnmapProcessMemory(reinterpret_cast<void*>(local), process, page, size);
++}
++
++} // namespace
++
++bool roIsHelperCommand(u32 command) {
++    return (command >= HelperQuery && command <= HelperTextRead) || command == HelperBulkRead;
++}
++
++Result roHelperRequest(u32 command, const u64* input, u32 bytes, Handle process,
++                       u64* out, u32* output_bytes, void* receive, u64 receive_size) {
++    *output_bytes = 64;
++    if (bytes < 32)
++        return BadInput;
++    if (receive_size && command != HelperBulkRead)
++        return BadInput;
++    u64 pid = 0, program = 0;
++    const Result pid_rc = svcGetProcessId(&pid, process);
++    const Result program_rc = svcGetInfo(&program, InfoType_ProgramId, process, 0);
++    out[0] = pid;
++    out[1] = program;
++    out[2] = pid_rc | (static_cast<u64>(program_rc) << 32);
++    if (R_FAILED(pid_rc))
++        return pid_rc;
++    if (R_FAILED(program_rc))
++        return program_rc; // Also rejects non-process handles.
++    if (input[0] && input[0] != pid)
++        return BadInput;
++    const bool fs = program == FilesystemProgramId;
++    MemoryInfo block = {};
++    u32 page_info = 0;
++    const Result queried = svcQueryProcessMemory(&block, &page_info, process, input[1]);
++    out[3] = queried;
++
++    if (command == HelperQuery) {
++        copyInfo(out + 4, block);
++        *output_bytes = 104;
++        out[9] = info(InfoType_AslrRegionAddress, process);
++        out[10] = info(InfoType_AslrRegionSize, process);
++        out[11] = freeRemoteAddress(process, 0x1000);
++        virtmemLock();
++        out[12] = reinterpret_cast<u64>(virtmemFindAslr(0x1000, 0x1000));
++        virtmemUnlock();
++        return queried;
++    }
++    if (!input[0] || R_FAILED(queried))
++        return R_FAILED(queried) ? queried : BadInput;
++
++    if (command == HelperTextRead) {
++        // Toggle only the read bit of native FS executable pages.
++        const u64 address = input[1], size = input[2], permission = input[3];
++        if (!fs || (address | size) & 0xfff || !size || size > 0x4000000 || block.type != MemType_CodeStatic ||
++            block.attr || (block.perm != 4 && block.perm != 5) || (permission != 4 && permission != 5) ||
++            address + size < address || address + size > block.addr + block.size)
++            return BadInput;
++        out[3] = block.perm;
++        out[4] = svcSetProcessMemoryPermission(process, address, size, static_cast<u32>(permission));
++        if (out[4])
++            return out[4];
++        MemoryInfo after = {};
++        const Result q = svcQueryProcessMemory(&after, &page_info, process, address);
++        out[5] = q;
++        copyInfo(out + 6, after);
++        *output_bytes = 88;
++        return q;
++    }
++    if (command == HelperBulkRead) {
++        // At most 4 MiB through a temporary alias in RO.
++        const u64 source = input[1], length = input[2], page = source & ~0xfffULL;
++        if (!receive || !length || length > 0x400000 || length > receive_size || source + length < source ||
++            source + length > block.addr + block.size ||
++            (block.type != MemType_CodeStatic && block.type != MemType_CodeMutable) || block.attr)
++            return BadInput;
++        const u64 size = ((source & 0xfff) + length + 0xfff) & ~0xfffULL;
++        u64 local = 0;
++        out[4] = mapLocal(process, page, size, &local);
++        out[3] = local;
++        if (out[4])
++            return out[4];
++        std::memcpy(receive, reinterpret_cast<const void*>(local + (source & 0xfff)), length);
++        out[5] = unmapLocal(process, local, page, size);
++        out[6] = length;
++        return out[5];
++    }
++    if (command == HelperPatch16) {
++        // One aligned instruction block, with exact expected bytes and readback.
++        const u64 address = input[1], size = input[2], page = address & ~0xfffULL;
++        *output_bytes = 80;
++        if (!fs || bytes < 64 || size != 16 || address & 3 || (address & 0xfff) + size > 0x1000 ||
++            !(block.perm & 4) || block.attr || address + size > block.addr + block.size)
++            return BadInput;
++        u64 local = 0;
++        out[4] = mapLocal(process, page, 0x1000, &local);
++        out[9] = local;
++        if (out[4])
++            return out[4];
++        MemoryInfo alias = {};
++        Result result = svcQueryMemory(&alias, &page_info, local);
++        out[5] = alias.perm | (static_cast<u64>(alias.attr) << 32);
++        if (R_SUCCEEDED(result) && (alias.perm != Perm_Rw || alias.attr))
++            result = BadInput;
++        volatile u8* mapped = reinterpret_cast<volatile u8*>(local + (address & 0xfff));
++        const u8* expected = reinterpret_cast<const u8*>(input + 4);
++        const u8* replacement = reinterpret_cast<const u8*>(input + 6);
++        if (R_SUCCEEDED(result)) {
++            out[6] = 1;
++            for (u32 i = 0; i < size; i++)
++                if (mapped[i] != expected[i])
++                    out[6] = 0;
++            if (!out[6])
++                result = BadInput;
++        }
++        if (R_SUCCEEDED(result)) {
++            volatile u32* instructions = reinterpret_cast<volatile u32*>(mapped);
++            u32 words[4];
++            std::memcpy(words, replacement, sizeof(words));
++            for (u32 i = 0; i < 4; i++)
++                instructions[i] = words[i];
++            publishCode(reinterpret_cast<u64>(mapped), size);
++            out[7] = 1;
++            for (u32 i = 0; i < size; i++)
++                if (mapped[i] != replacement[i])
++                    out[7] = 0;
++            if (!out[7])
++                result = BadInput;
++        }
++        out[8] = unmapLocal(process, local, page, 0x1000);
++        return out[8] ? out[8] : result;
++    }
++    if (command == HelperSmallRead) {
++        const u64 source = input[1], length = input[2], page = source & ~0xfffULL;
++        if (!length || length > 128 || (source & 0xfff) + length > 0x1000)
++            return BadInput;
++        u64 local = 0;
++        out[4] = mapLocal(process, page, 0x1000, &local);
++        out[3] = local;
++        if (out[4])
++            return out[4];
++        std::memcpy(out + 7, reinterpret_cast<const void*>(local + (source & 0xfff)), length);
++        out[5] = unmapLocal(process, local, page, 0x1000);
++        out[6] = length;
++        *output_bytes = 56 + length;
++        return out[5];
++    }
++    if (command == HelperMapCode) {
++        // One caller-owned Normal/RW page; preserve the source if protection fails.
++        const u64 source = input[1], destination = input[2], size = input[3];
++        if (!fs || (source | destination) & 0xfff || size != 0x1000 || block.type != MemType_Normal ||
++            block.perm != Perm_Rw || block.attr || source + size > block.addr + block.size)
++            return BadInput;
++        MemoryInfo target = {};
++        const Result q = svcQueryProcessMemory(&target, &page_info, process, destination);
++        if (R_FAILED(q) || target.type != MemType_Unmapped || destination + size > target.addr + target.size)
++            return R_FAILED(q) ? q : BadInput;
++        out[3] = svcMapProcessCodeMemory(process, destination, source, size);
++        if (out[3])
++            return out[3];
++        out[4] = svcSetProcessMemoryPermission(process, destination, size, Perm_Rx);
++        if (out[4])
++            out[5] = svcUnmapProcessCodeMemory(process, destination, source, size);
++        return out[4];
++    }
++    if (command == HelperUnmapCode) {
++        const u64 source = input[1], destination = input[2], size = input[3];
++        if (!fs || (source | destination) & 0xfff || size != 0x1000)
++            return BadInput;
++        return svcUnmapProcessCodeMemory(process, destination, source, size);
++    }
++    return BadInput;
++}
+diff --git a/ro/source/helper_ops.h b/ro/source/helper_ops.h
+new file mode 100644
+index 0000000..55166ae
+--- /dev/null
++++ b/ro/source/helper_ops.h
+@@ -0,0 +1,30 @@
++// SPDX-License-Identifier: GPL-2.0-only
++// switch2-scripts: the ns2jb RO helper's process commands on ro:dmnt, so a
++// homebrew program can do what ns2jb-modloader's PC host does over RPC.
++#pragma once
++
++#include <switch.h>
++
++/// ns2jb helper command IDs. 0x524f0016 is kaiHEN's own read, so the helper's
++/// bulk read is served as HelperBulkRead instead.
++enum : u32 {
++    HelperQuery = 0x524f0010,      ///< Memory info at an address, region bounds, free addresses.
++    HelperSmallRead = 0x524f0011,  ///< Up to 128 bytes of any mapped page.
++    HelperMapCode = 0x524f0012,    ///< Map one RW page of FS as RX code (FS only).
++    HelperUnmapCode = 0x524f0013,  ///< Undo HelperMapCode (FS only).
++    HelperPatch16 = 0x524f0014,    ///< 16-byte instruction patch with expected bytes and readback (FS only).
++    HelperTextRead = 0x524f0015,   ///< Toggle the read bit of FS executable pages (FS only).
++    HelperBulkRead = 0x524f0026,   ///< The helper's 0x524f0016: up to 4 MiB of code memory.
++};
++
++/// True for the IDs above.
++bool roIsHelperCommand(u32 command);
++
++/**
++ * @brief Runs one helper command, as the ns2jb helper's process_request.
++ * @param input At least 32 bytes: process ID (0 = any for HelperQuery), address, then command fields.
++ * @param out 23 u64 of reply data; @p output_bytes says how many bytes are used.
++ * @param receive The receive buffer of HelperBulkRead, else null.
++ */
++Result roHelperRequest(u32 command, const u64* input, u32 bytes, Handle process,
++                       u64* out, u32* output_bytes, void* receive, u64 receive_size);
+diff --git a/ro/source/wire.cpp b/ro/source/wire.cpp
+index e9591ef..aa993f3 100644
+--- a/ro/source/wire.cpp
++++ b/ro/source/wire.cpp
+@@ -178,6 +178,10 @@ void roWriteReply(void* base, Result rc, u64 value, bool has_value) {
+     writeReplyMessage(base, rc, send_value ? &value : nullptr, send_value ? sizeof(value) : 0, 0, INVALID_HANDLE);
+ }
+ 
++void roWriteDataReply(void* base, Result rc, const void* data, u32 size) {
++    writeReplyMessage(base, rc, data, size, 0, INVALID_HANDLE);
++}
++
+ void roWriteHandleReply(void* base, Result rc, Handle handle) {
+     writeReplyMessage(base, rc, nullptr, 0, R_SUCCEEDED(rc) ? 1 : 0, handle);
+ }
+diff --git a/ro/source/wire.h b/ro/source/wire.h
+index 082a3d9..85762b2 100644
+--- a/ro/source/wire.h
++++ b/ro/source/wire.h
+@@ -59,6 +59,9 @@ bool roReplyQueryPointerBufferSize(void* base);
+ /// Writes a reply. With has_value and a successful rc, a u64 value follows the CMIF header.
+ void roWriteReply(void* base, Result rc, u64 value, bool has_value);
+ 
++/// Writes a reply with @p size bytes of data (at most 184), whatever @p rc is.
++void roWriteDataReply(void* base, Result rc, const void* data, u32 size);
++
+ /// Writes a reply with a COPY of @p handle on success.
+ void roWriteHandleReply(void* base, Result rc, Handle handle);
+ 
+-- 
+2.49.0.windows.1
+

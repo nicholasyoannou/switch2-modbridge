@@ -1,0 +1,28 @@
+From c16b1f230dd03f12322a46d6f9ce0942c43e8a6c Mon Sep 17 00:00:00 2001
+From: switch2-scripts <switch2-scripts@localhost>
+Date: Fri, 20 Nov 2026 00:00:04 +0000
+Subject: [PATCH 5/5] ro:dmnt: map-code source must be heap (type 5), as in the
+ ns2jb helper
+
+libnx's MemType_Normal is 2; the helper checks for type 5, which libnx calls
+MemType_Heap. FS's heap pages are type 5, so 0x524f0012 refused every map.
+---
+ ro/source/helper_ops.cpp | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/ro/source/helper_ops.cpp b/ro/source/helper_ops.cpp
+index e21d110..796b953 100644
+--- a/ro/source/helper_ops.cpp
++++ b/ro/source/helper_ops.cpp
+@@ -257,7 +257,7 @@ Result roHelperRequest(u32 command, const u64* input, u32 bytes, Handle process,
+     if (command == HelperMapCode) {
+         // One caller-owned Normal/RW page; preserve the source if protection fails.
+         const u64 source = input[1], destination = input[2], size = input[3];
+-        if (!fs || (source | destination) & 0xfff || size != 0x1000 || block.type != MemType_Normal ||
++        if (!fs || (source | destination) & 0xfff || size != 0x1000 || block.type != MemType_Heap ||
+             block.perm != Perm_Rw || block.attr || source + size > block.addr + block.size)
+             return BadInput;
+         MemoryInfo target = {};
+-- 
+2.49.0.windows.1
+

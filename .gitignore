@@ -1,0 +1,15 @@
+build/
+out/
+*.nro
+*.elf
+*.nacp
+tools/modbridge/runs/
+logs/
+dumps/
+*.pak
+*.raw
+*.bin
+civ7-fs-kaihen/
+__pycache__/
+moader-src/
+moader-state/

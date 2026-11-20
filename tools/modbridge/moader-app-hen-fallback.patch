@@ -1,0 +1,35 @@
+diff --git a/native/app.cpp b/native/app.cpp
+index 4f29402..1fd2a47 100644
+--- a/native/app.cpp
++++ b/native/app.cpp
+@@ -36,6 +36,12 @@ Result open_hen(){
+     if(R_SUCCEEDED(rc))rc=kaihenOpenHomebrewSession(&ro,&hen);
+     return rc;
+ }
++// Official kaiHEN 20261117.1 also reports protocol 7 but has no reload commands (its 23 is GetLoaderRoot):
++// only a HEN that answers GetReloadCapabilities is Moader's, otherwise use plugin enumeration.
++bool moader_hen(const HenStatus& status){
++    HenReloadCapabilities caps{};
++    return status.protocol_version>=7&&R_SUCCEEDED(henGetReloadCapabilities(&hen,&caps));
++}
+ struct ReloadTransport {
+     Result get_info(HenPluginInfo& out){
+         const auto name=moader_name();Result rc=henGetPluginInfo(&hen,&name,&out);
+@@ -80,7 +86,7 @@ Result connect(){
+     Result rc=open_hen();if(R_FAILED(rc))return rc;
+     HenStatus status{};rc=henGetStatus(&hen,&status);if(R_FAILED(rc))return rc;
+     hen_protocol_known=true;
+-    modern_hen=status.protocol_version>=7;
++    modern_hen=moader_hen(status);
+     if(modern_hen){
+         HenReloadCapabilities caps{};rc=henGetReloadCapabilities(&hen,&caps);
+         if(R_FAILED(rc)||caps.version!=1||(caps.flags&~7u)){
+@@ -344,7 +350,7 @@ bool allow_hbmenu_return(){
+         if(R_FAILED(rc)){
+             reload.observe_manager(0,false);sync_reload_ui();return false;
+         }
+-        hen_protocol_known=true;modern_hen=status.protocol_version>=7;
++        hen_protocol_known=true;modern_hen=moader_hen(status);
+         if(!modern_hen)reload.observe_manager(0,true);
+     }
+     const bool allowed=modern_hen?reload.inspect_exit(reload_transport,monotonic_ms()):reload.can_exit();
