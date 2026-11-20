@@ -92,7 +92,7 @@ As for the performance of these mods, on the 120 FPS variant (since the Switch d
 
 <table>
   <tr>
-    <th>Docked</th>
+    <th>Docked (<a href="https://otgsytpue8.ufs.sh/f/9ac2dkswyWNhj8VvcBO1q97hVzMGdt3uYH5wWr24TUCkSlos">uncompressed 1GB copy</a>)</th>
   </tr>
   <tr>
     <td><a href="https://otgsytpue8.ufs.sh/f/9ac2dkswyWNhd2rJjQzeNKOVcp7jsDAxfR8rYFL9mXPZ3QgS"><img width="540" height="304" alt="ff7r-demo-play" src="https://github.com/user-attachments/assets/2949e453-2bcb-4c76-a98f-a65f0ab2c5a5" /></a></td>
