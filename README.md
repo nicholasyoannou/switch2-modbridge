@@ -11,6 +11,8 @@ to FS through a patched kaiHEN.
 
 It also includes frame-rate mods for FINAL FANTASY VII REMAKE INTERGRADE (see [FF7 mods](#ff7-mods)).
 
+This repository is very much AI assisted with Claude, and is temperimental / experimental. Have tested with own Switch 2 and eShop FF7 games.
+
 ## Repo state
 
 Early code. A failed install can crash FS, which restarts the console. Mods stay installed until the next
